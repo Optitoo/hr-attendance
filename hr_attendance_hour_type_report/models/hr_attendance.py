@@ -45,7 +45,7 @@ class HrAttendance(models.Model):
 
     @api.depends("check_in")
     def _compute_date(self):
-        UTC = pytz.timezone("utc")
+        UTC = pytz.timezone("utc")        
         for rec in self:
             tz = rec.employee_id.tz
             check_in = rec.check_in
@@ -57,7 +57,6 @@ class HrAttendance(models.Model):
     @api.depends("check_in", "check_out")
     def _compute_worked_hours(self):
         res = super()._compute_worked_hours()
-        UTC = pytz.timezone("utc")
         for rec in self:
             rec.worked_hours_nighttime = 0
             rec.worked_hours_daytime = 0
@@ -67,49 +66,32 @@ class HrAttendance(models.Model):
                 raise exceptions.UserError(
                     _("More than 24h of work in 1 shift is forbidden")
                 )
-            night_start = rec.employee_id.company_id.hr_night_work_hour_start
-            hour_night_start = int(night_start)
-            minute_night_start = int(60 * (night_start - hour_night_start))
-            night_end = rec.employee_id.company_id.hr_night_work_hour_end
-            hour_night_end = int(night_end)
-            minute_night_end = int(60 * (night_end - hour_night_end))
-            tz = pytz.timezone(rec.employee_id.tz)
-            check_in = UTC.localize(rec.check_in)
-            check_out = UTC.localize(rec.check_out)
-            curr_day_night_start = tz.localize(
-                dt.datetime.combine(
-                    rec.date, dt.time(hour=hour_night_start, minute=minute_night_start)
-                )
-            ).astimezone(UTC)
-            curr_day_night_end = tz.localize(
-                dt.datetime.combine(
-                    rec.date, dt.time(hour=hour_night_end, minute=minute_night_end)
-                )
-            ).astimezone(UTC)
-            next_day_night_start = tz.localize(
-                dt.datetime.combine(
-                    rec.date + dt.timedelta(days=1),
-                    dt.time(hour=hour_night_start, minute=minute_night_start),
-                )
-            ).astimezone(UTC)
-            next_day_night_end = tz.localize(
-                dt.datetime.combine(
-                    rec.date + dt.timedelta(days=1),
-                    dt.time(hour=hour_night_end, minute=minute_night_end),
-                )
-            ).astimezone(UTC)
-            rec.worked_hours_nighttime += (
-                min(check_out, curr_day_night_end) - min(curr_day_night_end, check_in)
-            ).total_seconds() / 3600.0
-            if check_out > curr_day_night_start:
-                rec.worked_hours_nighttime += (
-                    min(check_out, next_day_night_end)
-                    - max(check_in, curr_day_night_start)
-                ).total_seconds() / 3600.0
-            rec.worked_hours_nighttime += (
-                max(check_out, next_day_night_start) - next_day_night_start
-            ).total_seconds() / 3600.0
-            if check_out > next_day_night_start:
-                _logger.warning("very long_shift for employee %s", rec.employee_id.id)
+            night_start = int(rec.employee_id.company_id.hr_night_work_hour_start) or 0
+            night_end = int(rec.employee_id.company_id.hr_night_work_hour_end) or 0    
+            rec.worked_hours_nighttime = calculate_night_hours(rec.check_in, rec.check_out, night_start, night_end)
             rec.worked_hours_daytime = rec.worked_hours - rec.worked_hours_nighttime
         return res
+
+def calculate_night_hours(check_in, check_out, night_start_hour=22, night_end_hour=6):
+    total_night_hours = 0.0
+    day = check_in.date() - dt.timedelta(days=1)  # On commence la veille au cas où
+
+    while day <= check_out.date():
+        # Création de la plage de nuit : peut être sur deux jours
+        night_start = dt.datetime.combine(day, dt.time(hour=night_start_hour), tzinfo=check_in.tzinfo)
+        if night_end_hour > night_start_hour:
+            night_end = dt.datetime.combine(day, dt.time(hour=night_end_hour), tzinfo=check_in.tzinfo)
+        else:
+            night_end = dt.datetime.combine(day + dt.timedelta(days=1), dt.time(hour=night_end_hour), tzinfo=check_in.tzinfo)
+
+        # Vérifie chevauchement réel
+        overlap_start = max(check_in, night_start)
+        overlap_end = min(check_out, night_end)
+
+        if overlap_end > overlap_start:
+            seconds = (overlap_end - overlap_start).total_seconds()
+            total_night_hours += seconds / 3600.0 + 1
+
+        day += dt.timedelta(days=1)
+
+    return total_night_hours
